@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 智能报销 (Supabase 精简版)</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <style>
+        body { font-family: -apple-system, system-ui, sans-serif; }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+        .animate-in { animation: fadeIn 0.2s ease-out; }
+        @keyframes fadeIn { from { opacity: 0; transform: scale(0.98); } to { opacity: 1; transform: scale(1); } }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-800">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useMemo, useRef } = React;
+
+        // --- 配置 ---
+        const SUPABASE_PROJECT_ID = "kizandyfonohbbnxxvzf";
+        const SUPABASE_URL = `https://${SUPABASE_PROJECT_ID}.supabase.co`;
+        const SUPABASE_ANON_KEY = "sb_publishable_ah_LeCeQ8Zwe2Z_v_cQavw_Cj-EVZkE";
+        const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+        const TABLE_RECORDS = 'reimbursement_records';
+        const TABLE_INVOICES = 'reimbursement_invoices';
+
+        // --- AI 逻辑 ---
+        const DEEPSEEK_MODELS = [
+            { id: "deepseek-ai/DeepSeek-V3", name: "DeepSeek V3 (推荐)" },
+            { id: "deepseek-ai/DeepSeek-R1", name: "DeepSeek R1 (推理)" }
+        ];
+
+        const callSiliconFlowAI = async (userInput, apiKey, modelId) => {
+            if (!apiKey) throw new Error("请配置 API Key");
+            const today = new Date().toISOString().split('T')[0];
+            const systemPrompt = `你是一个财务报销助理。当前日期${today}。
+从输入提取JSON(不含markdown)：
+1. customer: 公司名(非人名)
+2. transportDetail: 交通明细(保留算式)
+3. accommodationDetail: 仅酒店名
+4. shoppingDetail: 物品名+金额
+5. remark: 购物背景/行程目的(去金额)
+6. transportCost: 交通总额
+字段: startDate, endDate, customer, transportCost, transportDetail, accommodation, accommodationDetail, allowance, dining, diningDetail, shoppingDetail, remark`;
+
+            const res = await fetch("https://api.siliconflow.cn/v1/chat/completions", {
+                method: "POST",
+                headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    model: modelId,
+                    messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userInput }],
+                    response_format: { type: "json_object" },
+                    temperature: 0.1
+                })
+            });
+            if (!res.ok) throw new Error(await res.text());
+            const data = await res.json();
+            return JSON.parse((data.choices[0]?.message?.content || "{}").replace(/```json|```/g, '').trim());
+        };
+
+        // --- 工具函数 ---
+        const Icon = ({ name, size = 18, className = "" }) => {
+            const ref = useRef(null);
+            useEffect(() => {
+                if (window.lucide && ref.current) {
+                    ref.current.innerHTML = `<i data-lucide="${name}" width="${size}" height="${size}" class="${className}"></i>`;
+                    window.lucide.createIcons({ root: ref.current });
+                }
+            }, [name, size, className]);
+            return <span ref={ref} className="inline-flex align-middle" />;
+        };
+        
+        const I = (name) => (props) => <Icon name={name} {...props} />;
+        // [修复] 补充遗漏的 CheckSquare 和 Square 图标
+        const Icons = { 
+            Plus: I('plus'), 
+            Save: I('save'), 
+            X: I('x'), 
+            Edit: I('edit-2'), 
+            Trash: I('trash-2'), 
+            Wallet: I('wallet'), 
+            Cloud: I('cloud'), 
+            Loader: (p)=><Icon name="loader-2" className="animate-spin" {...p}/>, 
+            Settings: I('settings'), 
+            Download: I('download'), 
+            Upload: I('upload'), 
+            Sparkles: I('sparkles'), 
+            Check: I('check'), 
+            Receipt: I('receipt'), 
+            ChevronLeft: I('chevron-left'), 
+            ChevronRight: I('chevron-right'), 
+            Alert: I('alert-triangle'),
+            CheckSquare: I('check-square'), // 补全
+            Square: I('square')             // 补全
+        };
+
+        const formatMoney = (n) => new Intl.NumberFormat('zh-CN', { style: 'currency', currency: 'CNY' }).format(n || 0);
+        const parseShopping = (txt) => (txt || '').split(/[+＋,，\s]+/).map(p => {
+            const m = p.match(/(\d+(\.\d+)?)/);
+            return m ? { name: p.replace(m[0], '').trim() || '商品', amount: parseFloat(m[0]) } : null;
+        }).filter(Boolean);
+
+        const generateInvoices = (rec, recId) => {
+            const base = { date: rec.startDate || rec.date, customer: rec.customer, status: 'uninvoiced', sourceRecordId: recId };
+            const list = [];
+            if (rec.accommodation > 0) list.push({ ...base, itemName: '住宿费', amount: rec.accommodation, remark: rec.accommodationDetail });
+            if (rec.dining > 0) list.push({ ...base, itemName: '招待费', amount: rec.dining, remark: rec.diningDetail });
+            const shops = parseShopping(rec.shoppingDetail);
+            if (rec.shoppingCost > 0) {
+                if (shops.length) shops.forEach(s => list.push({ ...base, itemName: s.name, amount: s.amount, remark: '购物明细' }));
+                else list.push({ ...base, itemName: '办公用品', amount: rec.shoppingCost, remark: '购物费' });
+            }
+            return list;
+        };
+
+        // --- 组件 ---
+        const Modal = ({ title, children, onClose }) => (
+            <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50 backdrop-blur-sm animate-in">
+                <div className="bg-white rounded-xl shadow-2xl w-full max-w-lg overflow-hidden flex flex-col max-h-[90vh]">
+                    <div className="px-6 py-4 border-b flex justify-between items-center bg-gray-50">
+                        <h3 className="font-bold text-gray-800">{title}</h3>
+                        <button onClick={onClose}><Icons.X className="text-gray-400 hover:text-gray-600"/></button>
+                    </div>
+                    <div className="p-6 overflow-y-auto">{children}</div>
+                </div>
+            </div>
+        );
+
+        const SettingsModal = ({ isOpen, onClose, config, onSaveConfig, onImport, onExport, loading }) => {
+            const [local, setLocal] = useState(config);
+            const fileRef = useRef();
+            if (!isOpen) return null;
+            return (
+                <Modal title="设置与备份" onClose={onClose}>
+                    <div className="space-y-6">
+                        <div className="bg-purple-50 p-4 rounded border border-purple-100 space-y-3">
+                            <h4 className="text-sm font-bold text-purple-900 flex gap-2"><Icons.Sparkles size={16}/> AI 配置</h4>
+                            <input type="password" value={local.apiKey || ''} onChange={e => setLocal({...local, apiKey: e.target.value})} placeholder="Silicon Flow API Key" className="w-full border p-2 rounded text-sm"/>
+                            <select value={local.model || ''} onChange={e => setLocal({...local, model: e.target.value})} className="w-full border p-2 rounded text-sm">
+                                {DEEPSEEK_MODELS.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+                            </select>
+                            <button onClick={() => onSaveConfig(local)} className="w-full bg-purple-600 text-white py-1.5 rounded text-sm hover:bg-purple-700">保存配置</button>
+                        </div>
+                        <div className="grid grid-cols-2 gap-4">
+                            <button onClick={onExport} disabled={loading} className="p-3 border rounded hover:bg-blue-50 text-blue-700 flex flex-col items-center gap-1 text-xs">
+                                <Icons.Download/> 导出备份
+                            </button>
+                            <button onClick={() => fileRef.current.click()} disabled={loading} className="p-3 border rounded hover:bg-orange-50 text-orange-700 flex flex-col items-center gap-1 text-xs">
+                                {loading ? <Icons.Loader/> : <Icons.Upload/>} 恢复备份
+                            </button>
+                            <input type="file" ref={fileRef} className="hidden" accept=".json" onChange={e => e.target.files[0] && onImport(e.target.files[0])} />
+                        </div>
+                    </div>
+                </Modal>
+            );
+        };
+
+        const ExpenseForm = ({ data, onSave, onCancel, date, aiConfig }) => {
+            const [form, setForm] = useState({ 
+                startDate: date, endDate: date, customer: '', transportCost: 0, transportDetail: '', accommodation: 0, accommodationDetail: '', 
+                allowance: 0, dining: 0, diningDetail: '', shoppingCost: 0, shoppingDetail: '', remark: '', ...data 
+            });
+            const [aiInput, setAiInput] = useState('');
+            const [aiLoading, setAiLoading] = useState(false);
+
+            const handleAI = async () => {
+                if (!aiInput || !aiConfig.apiKey) return alert("请先配置 API Key");
+                setAiLoading(true);
+                try {
+                    const res = await callSiliconFlowAI(aiInput, aiConfig.apiKey, aiConfig.model);
+                    setForm(prev => ({ ...prev, ...res }));
+                } catch (e) { alert("识别失败: " + e.message); }
+                setAiLoading(false);
+            };
+
+            const handleChange = (e) => setForm({ ...form, [e.target.name]: e.target.value });
+            
+            useEffect(() => { 
+                if(form.transportDetail) {
+                    const sum = (form.transportDetail.match(/(\d+(\.\d+)?)/g)||[]).reduce((a,b)=>a+parseFloat(b),0);
+                    setForm(f => ({...f, transportCost: Math.round(sum*100)/100}));
+                }
+            }, [form.transportDetail]);
+            useEffect(() => { 
+                if(form.shoppingDetail) {
+                    const sum = (form.shoppingDetail.match(/(\d+(\.\d+)?)/g)||[]).reduce((a,b)=>a+parseFloat(b),0);
+                    setForm(f => ({...f, shoppingCost: Math.round(sum*100)/100}));
+                }
+            }, [form.shoppingDetail]);
+
+            return (
+                <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+                    <div className="bg-white rounded-xl shadow-2xl w-full max-w-4xl max-h-[95vh] overflow-y-auto flex flex-col">
+                        <div className="bg-blue-600 text-white p-4 flex justify-between items-center sticky top-0 z-10">
+                            <h2 className="font-bold flex gap-2">{data ? <Icons.Edit/> : <Icons.Plus/>} {data ? '编辑' : '新建'}记录</h2>
+                            <button onClick={onCancel}><Icons.X/></button>
+                        </div>
+                        <div className="p-6 space-y-6 flex-1">
+                            <div className="bg-indigo-50 p-4 rounded-lg border border-indigo-100">
+                                <div className="flex gap-2">
+                                    <textarea value={aiInput} onChange={e => setAiInput(e.target.value)} placeholder="AI 识别：昨天去华为出差，高铁200..." className="flex-1 p-2 border rounded text-sm h-20"/>
+                                    <button onClick={handleAI} disabled={aiLoading} className="bg-indigo-600 text-white px-4 rounded hover:bg-indigo-700 disabled:opacity-50 flex flex-col items-center justify-center text-xs w-20">
+                                        {aiLoading ? <Icons.Loader/> : <Icons.Sparkles/>} 识别
+                                    </button>
+                                </div>
+                            </div>
+                            <div className="grid grid-cols-2 gap-4">
+                                <label className="block text-sm font-bold text-gray-700">开始日期 <input type="date" name="startDate" value={form.startDate || ''} onChange={handleChange} className="w-full border p-2 rounded mt-1"/></label>
+                                <label className="block text-sm font-bold text-gray-700">结束日期 <input type="date" name="endDate" value={form.endDate || ''} onChange={handleChange} className="w-full border p-2 rounded mt-1"/></label>
+                                <label className="block text-sm font-bold text-gray-700 col-span-2">客户 <input name="customer" value={form.customer || ''} onChange={handleChange} className="w-full border p-2 rounded mt-1" placeholder="公司名称"/></label>
+                            </div>
+                            <div className="space-y-4">
+                                <div className="p-3 bg-blue-50 rounded border border-blue-100 grid grid-cols-3 gap-2">
+                                    <div className="col-span-3 text-xs font-bold text-blue-800">交通</div>
+                                    <input name="transportDetail" value={form.transportDetail || ''} onChange={handleChange} placeholder="明细" className="col-span-2 border p-2 rounded text-sm"/>
+                                    <input type="number" value={form.transportCost || 0} readOnly className="bg-gray-100 border p-2 rounded text-sm font-bold text-right"/>
+                                </div>
+                                <div className="grid grid-cols-2 gap-4">
+                                    <div className="p-3 bg-gray-50 rounded border flex gap-2 items-center">
+                                        <span className="text-xs font-bold w-10">住宿</span>
+                                        <input type="number" name="accommodation" value={form.accommodation ?? ''} onChange={handleChange} className="w-20 border p-1 rounded text-sm"/>
+                                        <input name="accommodationDetail" value={form.accommodationDetail || ''} onChange={handleChange} placeholder="酒店名" className="flex-1 border p-1 rounded text-sm"/>
+                                    </div>
+                                    <div className="p-3 bg-gray-50 rounded border flex gap-2 items-center">
+                                        <span className="text-xs font-bold w-10">招待</span>
+                                        <input type="number" name="dining" value={form.dining ?? ''} onChange={handleChange} className="w-20 border p-1 rounded text-sm"/>
+                                        <input name="diningDetail" value={form.diningDetail || ''} onChange={handleChange} placeholder="备注" className="flex-1 border p-1 rounded text-sm"/>
+                                    </div>
+                                </div>
+                                <div className="p-3 bg-orange-50 rounded border border-orange-100 grid grid-cols-3 gap-2">
+                                    <div className="col-span-3 text-xs font-bold text-orange-800">购物 (空格分隔)</div>
+                                    <input name="shoppingDetail" value={form.shoppingDetail || ''} onChange={handleChange} placeholder="烟100 酒200" className="col-span-2 border p-2 rounded text-sm"/>
+                                    <input type="number" value={form.shoppingCost || 0} readOnly className="bg-gray-100 border p-2 rounded text-sm font-bold text-right"/>
+                                </div>
+                                <div className="flex gap-2 items-center">
+                                    <span className="text-sm font-bold">补助</span>
+                                    <input type="number" name="allowance" value={form.allowance ?? ''} onChange={handleChange} className="w-24 border p-2 rounded"/>
+                                </div>
+                                <textarea name="remark" value={form.remark || ''} onChange={handleChange} placeholder="备注..." className="w-full border p-2 rounded h-20 text-sm"/>
+                            </div>
+                        </div>
+                        <div className="p-4 bg-gray-50 flex justify-end gap-3 sticky bottom-0">
+                            <button onClick={onCancel} className="px-4 py-2 border rounded hover:bg-gray-100">取消</button>
+                            <button onClick={() => onSave({ ...form, date: form.startDate, transportCost: parseFloat(form.transportCost)||0, accommodation: parseFloat(form.accommodation)||0, allowance: parseFloat(form.allowance)||0, dining: parseFloat(form.dining)||0, shoppingCost: parseFloat(form.shoppingCost)||0 })} className="px-6 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 flex items-center gap-2 font-medium">
+                                <Icons.Save size={16}/> 保存
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // --- 主程序 ---
+        const App = () => {
+            const [recs, setRecs] = useState([]);
+            const [invs, setInvs] = useState([]);
+            const [loading, setLoading] = useState(true);
+            const [tab, setTab] = useState('list');
+            const [month, setMonth] = useState(new Date().toISOString().slice(0, 7));
+            const [modal, setModal] = useState({ type: null, data: null });
+            const [deleteId, setDeleteId] = useState(null); // 删除确认状态
+            const [aiConfig, setAiConfig] = useState(() => JSON.parse(localStorage.getItem('ai_cfg') || '{"model":"deepseek-ai/DeepSeek-V3"}'));
+            
+            const newRecordDefaultDate = new Date().toISOString().split('T')[0];
+
+            const fetchData = async () => {
+                setLoading(true);
+                const [r, i] = await Promise.all([supabase.from(TABLE_RECORDS).select('*'), supabase.from(TABLE_INVOICES).select('*')]);
+                if (r.data) setRecs(r.data);
+                if (i.data) setInvs(i.data);
+                setLoading(false);
+            };
+
+            useEffect(() => {
+                fetchData();
+                const sub = supabase.channel('any')
+                    .on('postgres_changes', { event: '*', schema: 'public' }, () => fetchData())
+                    .subscribe();
+                return () => supabase.removeChannel(sub);
+            }, []);
+
+            const curRecs = useMemo(() => recs.filter(r => (r.date || '').startsWith(month)).sort((a,b) => a.date.localeCompare(b.date)), [recs, month]);
+            const curInvs = useMemo(() => invs.filter(i => (i.date || '').startsWith(month)).sort((a,b) => a.date.localeCompare(b.date)), [invs, month]);
+            const total = curRecs.reduce((s, r) => s + (r.transportCost||0) + (r.accommodation||0) + (r.allowance||0) + (r.dining||0) + (r.shoppingCost||0), 0);
+
+            const handleSave = async (data) => {
+                const { id, ...rest } = data;
+                let recId = id;
+                try {
+                    if (id) {
+                        const { error } = await supabase.from(TABLE_RECORDS).update(rest).eq('id', id);
+                        if (error) throw error;
+                    } else {
+                        const { data: newRec, error } = await supabase.from(TABLE_RECORDS).insert([rest]).select().single();
+                        if (error) throw error;
+                        recId = newRec.id;
+                    }
+                    await supabase.from(TABLE_INVOICES).delete().eq('sourceRecordId', recId).eq('status', 'uninvoiced');
+                    const newInvs = generateInvoices(rest, recId);
+                    if (newInvs.length) await supabase.from(TABLE_INVOICES).insert(newInvs);
+                    
+                    setModal({ type: null });
+                    fetchData();
+                    const savedMonth = (rest.date || rest.startDate || '').slice(0, 7);
+                    if (savedMonth && savedMonth !== month) setMonth(savedMonth);
+                } catch (e) {
+                    alert("保存失败: " + e.message);
+                }
+            };
+
+            const executeDelete = async () => {
+                if (!deleteId) return;
+                try {
+                    await Promise.all([
+                        supabase.from(TABLE_RECORDS).delete().eq('id', deleteId),
+                        supabase.from(TABLE_INVOICES).delete().eq('sourceRecordId', deleteId)
+                    ]);
+                    setDeleteId(null);
+                    fetchData(); // 强制刷新
+                } catch (e) {
+                    alert("删除失败: " + e.message);
+                }
+            };
+
+            const handleImport = async (file) => {
+                const reader = new FileReader();
+                reader.onload = async (e) => {
+                    try {
+                        setLoading(true);
+                        const { records, invoices } = JSON.parse(e.target.result);
+                        if(records?.length) await supabase.from(TABLE_RECORDS).upsert(records);
+                        if(invoices?.length) await supabase.from(TABLE_INVOICES).upsert(invoices);
+                        alert("导入成功");
+                        setModal({type:null});
+                        fetchData();
+                    } catch(err) { alert("导入出错: " + err.message); }
+                    setLoading(false);
+                };
+                reader.readAsText(file);
+            };
+
+            const handleExport = () => {
+                const url = URL.createObjectURL(new Blob([JSON.stringify({ records: recs, invoices: invs })], { type: 'application/json' }));
+                const a = document.createElement('a'); a.href = url; a.download = `backup_${month}.json`; a.click();
+            };
+
+            if (loading && !recs.length) return <div className="h-screen flex items-center justify-center text-blue-600"><Icons.Loader size={48}/></div>;
+
+            return (
+                <div className="min-h-screen bg-gray-50 pb-10">
+                    <header className="bg-white shadow sticky top-0 z-20 px-4 h-16 flex items-center justify-between">
+                        <div className="flex items-center gap-2 font-bold text-lg text-gray-800"><Icons.Cloud className="text-blue-600"/> AI 报销管理</div>
+                        <div className="flex bg-gray-100 rounded p-1 items-center">
+                            <button onClick={() => setMonth(m => {const d=new Date(m); d.setMonth(d.getMonth()-1); return d.toISOString().slice(0,7)})} className="p-1"><Icons.ChevronLeft/></button>
+                            <span className="px-2 font-mono font-bold">{month}</span>
+                            <button onClick={() => setMonth(m => {const d=new Date(m); d.setMonth(d.getMonth()+1); return d.toISOString().slice(0,7)})} className="p-1"><Icons.ChevronRight/></button>
+                        </div>
+                        <div className="flex gap-2">
+                            <button onClick={() => setModal({type:'settings'})} className="p-2 hover:bg-gray-100 rounded"><Icons.Settings/></button>
+                            <button onClick={() => setModal({type:'form'})} className="bg-blue-600 text-white px-3 py-1.5 rounded flex items-center gap-1 hover:bg-blue-700"><Icons.Plus size={16}/> 记一笔</button>
+                        </div>
+                    </header>
+
+                    <div className="max-w-6xl mx-auto mt-6 px-4">
+                        <div className="flex gap-4 border-b mb-4">
+                            {[{id:'list',n:'消费明细',i:'Wallet'}, {id:'uninv',n:'未开票',i:'Receipt'}, {id:'inv',n:'已开票',i:'CheckSquare'}].map(t => (
+                                <button key={t.id} onClick={() => setTab(t.id)} className={`pb-2 px-2 flex items-center gap-2 border-b-2 ${tab===t.id?'border-blue-600 text-blue-600':'border-transparent text-gray-500'}`}>
+                                    <Icon name={t.i}/> {t.n}
+                                </button>
+                            ))}
+                        </div>
+
+                        {tab === 'list' && (
+                            <>
+                                <div className="bg-gradient-to-r from-blue-600 to-indigo-700 text-white p-6 rounded-xl shadow-lg mb-6 flex justify-between items-center">
+                                    <div><div className="text-blue-100 text-xs uppercase">本月支出</div><div className="text-3xl font-bold">{formatMoney(total)}</div></div>
+                                    <div className="text-right"><div className="text-blue-100 text-xs">笔数</div><div className="text-xl font-bold">{curRecs.length}</div></div>
+                                </div>
+                                <div className="bg-white rounded-xl shadow border overflow-hidden">
+                                    <table className="w-full text-sm text-left">
+                                        <thead className="bg-gray-50 text-gray-500 font-medium border-b"><tr><th className="p-3">日期</th><th className="p-3">客户</th><th className="p-3 text-right">总额</th><th className="p-3">详情</th><th className="p-3 text-center">操作</th></tr></thead>
+                                        <tbody className="divide-y">{curRecs.map(r => (
+                                            <tr key={r.id} className="hover:bg-gray-50">
+                                                <td className="p-3 text-gray-600 whitespace-nowrap">{r.startDate}</td>
+                                                <td className="p-3 font-medium">{r.customer}</td>
+                                                <td className="p-3 text-right font-bold text-gray-800">{formatMoney((r.transportCost||0)+(r.accommodation||0)+(r.allowance||0)+(r.dining||0)+(r.shoppingCost||0))}</td>
+                                                <td className="p-3 text-gray-500 text-xs max-w-md truncate">{[r.transportDetail, r.accommodationDetail, r.diningDetail, r.shoppingDetail, r.remark].filter(Boolean).join(' | ')}</td>
+                                                <td className="p-3 text-center space-x-2">
+                                                    <button onClick={() => setModal({type:'form', data:r})} className="text-blue-600 hover:bg-blue-50 p-1 rounded"><Icons.Edit size={16}/></button>
+                                                    <button onClick={() => setDeleteId(r.id)} className="text-red-500 hover:bg-red-50 p-1 rounded"><Icons.Trash size={16}/></button>
+                                                </td>
+                                            </tr>
+                                        ))}</tbody>
+                                    </table>
+                                    {!curRecs.length && <div className="p-10 text-center text-gray-400">暂无记录</div>}
+                                </div>
+                            </>
+                        )}
+
+                        {tab !== 'list' && (
+                            <div className="bg-white rounded-xl shadow border overflow-hidden">
+                                <table className="w-full text-sm text-left">
+                                    <thead className="bg-gray-50 border-b"><tr><th className="p-3 w-10"></th><th className="p-3">日期</th><th className="p-3">客户</th><th className="p-3">项目</th><th className="p-3 text-right">金额</th><th className="p-3">备注</th></tr></thead>
+                                    <tbody className="divide-y">
+                                        {(tab==='uninv' ? curInvs.filter(i=>i.status==='uninvoiced') : curInvs.filter(i=>i.status==='invoiced')).map(i => (
+                                            <tr key={i.id} className="hover:bg-gray-50">
+                                                <td className="p-3 text-center">
+                                                    <button onClick={async()=>{await supabase.from(TABLE_INVOICES).update({status: i.status==='uninvoiced'?'invoiced':'uninvoiced'}).eq('id',i.id)}} className={i.status==='invoiced'?'text-green-600':'text-gray-300 hover:text-blue-500'}>
+                                                        {i.status==='invoiced' ? <Icons.CheckSquare/> : <Icons.Square/>}
+                                                    </button>
+                                                </td>
+                                                <td className="p-3">{i.date}</td>
+                                                <td className="p-3">{i.customer}</td>
+                                                <td className="p-3 font-medium">{i.itemName}</td>
+                                                <td className="p-3 text-right font-mono">{formatMoney(i.amount)}</td>
+                                                <td className="p-3 text-gray-400 text-xs">
+                                                    <input defaultValue={i.remark} onBlur={(e)=>supabase.from(TABLE_INVOICES).update({remark:e.target.value}).eq('id',i.id)} className="bg-transparent w-full focus:bg-white focus:ring-1 p-1 rounded"/>
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                                {!curInvs.length && <div className="p-10 text-center text-gray-400">列表为空</div>}
+                            </div>
+                        )}
+                    </div>
+
+                    {modal.type === 'form' && <ExpenseForm data={modal.data} date={newRecordDefaultDate} onSave={handleSave} onCancel={() => setModal({type:null})} aiConfig={aiConfig} />}
+                    {modal.type === 'settings' && <SettingsModal isOpen={true} config={aiConfig} onSaveConfig={(c)=>{setAiConfig(c);localStorage.setItem('ai_cfg',JSON.stringify(c));alert('已保存');setModal({type:null})}} onClose={()=>setModal({type:null})} onImport={handleImport} onExport={handleExport} loading={loading} />}
+                    
+                    {/* 删除确认弹窗 */}
+                    {deleteId && (
+                        <Modal title="确认删除" onClose={() => setDeleteId(null)}>
+                            <div className="space-y-4">
+                                <div className="flex items-start gap-3 bg-red-50 p-3 rounded-lg">
+                                    <Icons.Alert className="text-red-500 flex-shrink-0" size={24}/>
+                                    <p className="text-sm text-red-700">确定要删除这条记录吗？<br/>这将同时删除所有关联的发票条目，且操作无法恢复。</p>
+                                </div>
+                                <div className="flex justify-end gap-3 pt-2">
+                                    <button onClick={() => setDeleteId(null)} className="px-4 py-2 border rounded hover:bg-gray-50 text-sm">取消</button>
+                                    <button onClick={executeDelete} className="px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700 text-sm font-bold shadow-sm">确认删除</button>
+                                </div>
+                            </div>
+                        </Modal>
+                    )}
+                </div>
+            );
+        };
+
+        ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    </script>
+</body>
+</html>
