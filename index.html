@@ -80,7 +80,6 @@
         };
         
         const I = (name) => (props) => <Icon name={name} {...props} />;
-        // [修复] 补充遗漏的 CheckSquare 和 Square 图标
         const Icons = { 
             Plus: I('plus'), 
             Save: I('save'), 
@@ -99,8 +98,8 @@
             ChevronLeft: I('chevron-left'), 
             ChevronRight: I('chevron-right'), 
             Alert: I('alert-triangle'),
-            CheckSquare: I('check-square'), // 补全
-            Square: I('square')             // 补全
+            CheckSquare: I('check-square'),
+            Square: I('square')
         };
 
         const formatMoney = (n) => new Intl.NumberFormat('zh-CN', { style: 'currency', currency: 'CNY' }).format(n || 0);
@@ -366,11 +365,11 @@
                         </div>
                         <div className="flex gap-2">
                             <button onClick={() => setModal({type:'settings'})} className="p-2 hover:bg-gray-100 rounded"><Icons.Settings/></button>
-                            <button onClick={() => setModal({type:'form'})} className="bg-blue-600 text-white px-3 py-1.5 rounded flex items-center gap-1 hover:bg-blue-700"><Icons.Plus size={16}/> 记一笔</button>
+                            <button onClick={() => setModal({type:'form'})} className="bg-blue-600 text-white px-3 py-1.5 rounded flex items-center gap-1 hover:bg-blue-700"><Icons.Plus size={16}/> <span className="hidden sm:inline">记一笔</span></button>
                         </div>
                     </header>
 
-                    <div className="max-w-6xl mx-auto mt-6 px-4">
+                    <div className="max-w-7xl mx-auto mt-6 px-2 sm:px-4">
                         <div className="flex gap-4 border-b mb-4">
                             {[{id:'list',n:'消费明细',i:'Wallet'}, {id:'uninv',n:'未开票',i:'Receipt'}, {id:'inv',n:'已开票',i:'CheckSquare'}].map(t => (
                                 <button key={t.id} onClick={() => setTab(t.id)} className={`pb-2 px-2 flex items-center gap-2 border-b-2 ${tab===t.id?'border-blue-600 text-blue-600':'border-transparent text-gray-500'}`}>
@@ -387,16 +386,52 @@
                                 </div>
                                 <div className="bg-white rounded-xl shadow border overflow-hidden">
                                     <table className="w-full text-sm text-left">
-                                        <thead className="bg-gray-50 text-gray-500 font-medium border-b"><tr><th className="p-3">日期</th><th className="p-3">客户</th><th className="p-3 text-right">总额</th><th className="p-3">详情</th><th className="p-3 text-center">操作</th></tr></thead>
+                                        <thead className="bg-gray-50 text-gray-500 font-medium border-b">
+                                            <tr>
+                                                <th className="p-3">日期</th>
+                                                <th className="p-3">客户</th>
+                                                {/* PC端显示的详细列，手机端隐藏 */}
+                                                <th className="p-3 text-right hidden md:table-cell">交通</th>
+                                                <th className="p-3 text-right hidden md:table-cell">住宿</th>
+                                                <th className="p-3 text-right hidden md:table-cell">补助</th>
+                                                <th className="p-3 text-right hidden md:table-cell">招待</th>
+                                                <th className="p-3 text-right hidden md:table-cell">购物</th>
+                                                <th className="p-3 text-right">总计</th>
+                                                <th className="p-3 text-center">操作</th>
+                                            </tr>
+                                        </thead>
                                         <tbody className="divide-y">{curRecs.map(r => (
                                             <tr key={r.id} className="hover:bg-gray-50">
-                                                <td className="p-3 text-gray-600 whitespace-nowrap">{r.startDate}</td>
-                                                <td className="p-3 font-medium">{r.customer}</td>
-                                                <td className="p-3 text-right font-bold text-gray-800">{formatMoney((r.transportCost||0)+(r.accommodation||0)+(r.allowance||0)+(r.dining||0)+(r.shoppingCost||0))}</td>
-                                                <td className="p-3 text-gray-500 text-xs max-w-md truncate">{[r.transportDetail, r.accommodationDetail, r.diningDetail, r.shoppingDetail, r.remark].filter(Boolean).join(' | ')}</td>
-                                                <td className="p-3 text-center space-x-2">
-                                                    <button onClick={() => setModal({type:'form', data:r})} className="text-blue-600 hover:bg-blue-50 p-1 rounded"><Icons.Edit size={16}/></button>
-                                                    <button onClick={() => setDeleteId(r.id)} className="text-red-500 hover:bg-red-50 p-1 rounded"><Icons.Trash size={16}/></button>
+                                                <td className="p-3 text-gray-600 whitespace-nowrap align-top">{r.startDate}</td>
+                                                <td className="p-3 font-medium align-top max-w-[120px] md:max-w-none truncate">{r.customer}</td>
+                                                
+                                                {/* PC端显示的详细数据 */}
+                                                <td className="p-3 text-right hidden md:table-cell align-top">
+                                                    <div className="text-xs text-gray-500 truncate max-w-[150px] ml-auto">{r.transportDetail}</div>
+                                                    <div className="font-bold text-blue-600">{r.transportCost > 0 ? formatMoney(r.transportCost) : ''}</div>
+                                                </td>
+                                                <td className="p-3 text-right hidden md:table-cell align-top">
+                                                    <div className="text-xs text-gray-500 truncate max-w-[100px] ml-auto">{r.accommodationDetail}</div>
+                                                    <div>{r.accommodation > 0 ? formatMoney(r.accommodation) : ''}</div>
+                                                </td>
+                                                <td className="p-3 text-right hidden md:table-cell align-top">
+                                                    <div>{r.allowance > 0 ? formatMoney(r.allowance) : ''}</div>
+                                                </td>
+                                                <td className="p-3 text-right hidden md:table-cell align-top">
+                                                    <div className="text-xs text-gray-500 truncate max-w-[100px] ml-auto">{r.diningDetail}</div>
+                                                    <div>{r.dining > 0 ? formatMoney(r.dining) : ''}</div>
+                                                </td>
+                                                <td className="p-3 text-right hidden md:table-cell align-top">
+                                                    <div className="text-xs text-gray-500 truncate max-w-[100px] ml-auto">{r.shoppingDetail}</div>
+                                                    <div className="font-bold text-orange-600">{r.shoppingCost > 0 ? formatMoney(r.shoppingCost) : ''}</div>
+                                                </td>
+
+                                                <td className="p-3 text-right font-bold text-gray-800 align-top">{formatMoney((r.transportCost||0)+(r.accommodation||0)+(r.allowance||0)+(r.dining||0)+(r.shoppingCost||0))}</td>
+                                                <td className="p-3 text-center align-top">
+                                                    <div className="flex justify-center gap-2">
+                                                        <button onClick={() => setModal({type:'form', data:r})} className="text-blue-600 hover:bg-blue-50 p-1 rounded"><Icons.Edit size={16}/></button>
+                                                        <button onClick={() => setDeleteId(r.id)} className="text-red-500 hover:bg-red-50 p-1 rounded"><Icons.Trash size={16}/></button>
+                                                    </div>
                                                 </td>
                                             </tr>
                                         ))}</tbody>
